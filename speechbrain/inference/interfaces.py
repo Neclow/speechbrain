@@ -13,26 +13,23 @@ Authors:
  * Adel Moumen 2023
  * Pradnya Kandarkar 2023
 """
-
-import hashlib
 import logging
+import hashlib
 import sys
 import warnings
-from types import SimpleNamespace
-
 import torch
 import torchaudio
-from hyperpyyaml import load_hyperpyyaml
-from torch.nn import DataParallel as DP
+from types import SimpleNamespace
 from torch.nn import SyncBatchNorm
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-from speechbrain.dataio.batch import PaddedBatch, PaddedData
+from torch.nn import DataParallel as DP
+from hyperpyyaml import load_hyperpyyaml
+from speechbrain.utils.fetching import fetch
 from speechbrain.dataio.preprocess import AudioNormalizer
-from speechbrain.utils.data_pipeline import DataPipeline
+from torch.nn.parallel import DistributedDataParallel as DDP
 from speechbrain.utils.data_utils import split_path
 from speechbrain.utils.distributed import run_on_main
-from speechbrain.utils.fetching import fetch
+from speechbrain.dataio.batch import PaddedBatch, PaddedData
+from speechbrain.utils.data_pipeline import DataPipeline
 from speechbrain.utils.superpowers import import_from_path
 
 logger = logging.getLogger(__name__)
@@ -71,7 +68,7 @@ def foreign_class(
     ---------
     source : str or Path or FetchSource
         The location to use for finding the model. See
-        ``speechbrain.utils.fetching.fetch`` for details.
+        ``speechbrain.pretrained.fetching.fetch`` for details.
     hparams_file : str
         The name of the hyperparameters file to use for constructing
         the modules necessary for inference. Must contain two keys:
@@ -89,14 +86,12 @@ def foreign_class(
         Where to put the pretraining material. If not given, will use
         ./pretrained_models/<class-name>-hash(source).
     use_auth_token : bool (default: False)
-        If true Huggingface's auth_token will be used to load private models from the HuggingFace Hub,
+        If true Hugginface's auth_token will be used to load private models from the HuggingFace Hub,
         default is False because the majority of models are public.
     download_only : bool (default: False)
         If true, class and instance creation is skipped.
     huggingface_cache_dir : str
         Path to HuggingFace cache; if None -> "~/.cache/huggingface" (default: None)
-    **kwargs : dict
-        Arguments to forward to class constructor.
 
     Returns
     -------
@@ -272,7 +267,7 @@ class Pretrained(torch.nn.Module):
             for p in self.mods.parameters():
                 p.requires_grad = False
 
-    def load_audio(self, path, savedir="."):
+    def load_audio(self, path, savedir=".", fetch=True):
         """Load an audio file with this model's input spec
 
         When using a speech model, it is important to use the same type of data,
@@ -282,8 +277,9 @@ class Pretrained(torch.nn.Module):
         Similarly, it is simple to downmix a stereo file to mono.
         The path can be a local path, a web url, or a link to a huggingface repo.
         """
-        source, fl = split_path(path)
-        path = fetch(fl, source=source, savedir=savedir)
+        if fetch:
+            source, fl = split_path(path)
+            path = fetch(fl, source=source, savedir=savedir)
         signal, sr = torchaudio.load(str(path), channels_first=False)
         return self.audio_normalizer(signal, sr)
 
@@ -393,7 +389,6 @@ class Pretrained(torch.nn.Module):
         revision=None,
         download_only=False,
         huggingface_cache_dir=None,
-        overrides_must_match=True,
         **kwargs,
     ):
         """Fetch and load based from outside source based on HyperPyYAML file
@@ -415,7 +410,7 @@ class Pretrained(torch.nn.Module):
         ---------
         source : str
             The location to use for finding the model. See
-            ``speechbrain.utils.fetching.fetch`` for details.
+            ``speechbrain.pretrained.fetching.fetch`` for details.
         hparams_file : str
             The name of the hyperparameters file to use for constructing
             the modules necessary for inference. Must contain two keys:
@@ -435,7 +430,7 @@ class Pretrained(torch.nn.Module):
             Where to put the pretraining material. If not given, will use
             ./pretrained_models/<class-name>-hash(source).
         use_auth_token : bool (default: False)
-            If true Huggingface's auth_token will be used to load private models from the HuggingFace Hub,
+            If true Hugginface's auth_token will be used to load private models from the HuggingFace Hub,
             default is False because the majority of models are public.
         revision : str
             The model revision corresponding to the HuggingFace Hub model revision.
@@ -443,16 +438,12 @@ class Pretrained(torch.nn.Module):
             version of a model hosted at HuggingFace.
         download_only : bool (default: False)
             If true, class and instance creation is skipped.
+        revision : str
+            The model revision corresponding to the HuggingFace Hub model revision.
+            This is particularly useful if you wish to pin your code to a particular
+            version of a model hosted at HuggingFace.
         huggingface_cache_dir : str
             Path to HuggingFace cache; if None -> "~/.cache/huggingface" (default: None)
-        overrides_must_match : bool
-            Whether the overrides must match the parameters already in the file.
-        **kwargs : dict
-            Arguments to forward to class constructor.
-
-        Returns
-        -------
-        Instance of cls
         """
         if savedir is None:
             clsname = cls.__name__
@@ -491,26 +482,19 @@ class Pretrained(torch.nn.Module):
 
         # Load the modules:
         with open(hparams_local_path) as fin:
-            hparams = load_hyperpyyaml(
-                fin, overrides, overrides_must_match=overrides_must_match
-            )
+            hparams = load_hyperpyyaml(fin, overrides)
 
         # Pretraining:
-        pretrainer = hparams.get("pretrainer", None)
-        if pretrainer is not None:
-            pretrainer.set_collect_in(savedir)
-            # For distributed setups, have this here:
-            run_on_main(
-                pretrainer.collect_files, kwargs={"default_source": source}
-            )
-            # Load on the CPU. Later the params can be moved elsewhere by specifying
-            if not download_only:
-                # run_opts={"device": ...}
-                pretrainer.load_collected()
+        pretrainer = hparams["pretrainer"]
+        pretrainer.set_collect_in(savedir)
+        # For distributed setups, have this here:
+        run_on_main(pretrainer.collect_files, kwargs={"default_source": source})
+        # Load on the CPU. Later the params can be moved elsewhere by specifying
+        if not download_only:
+            # run_opts={"device": ...}
+            pretrainer.load_collected()
 
-                # Now return the system
-                return cls(hparams["modules"], hparams, **kwargs)
-        else:
+            # Now return the system
             return cls(hparams["modules"], hparams, **kwargs)
 
 
